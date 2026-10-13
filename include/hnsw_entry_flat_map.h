@@ -1,11 +1,11 @@
 #pragma once
 
-#include "storage/index/hnsw/hnsw_entry.h"
+#include "hnsw_entry.h"
 
-#include <boost/container/flat_set.hpp>
+#include <set>
 
 namespace HNSW {
 
-using HNSWEntryFlatMap = boost::container::flat_multiset<Entry, EntryLess>;
+using HNSWEntryFlatMap = std::multiset<Entry, EntryLess>;
 
 } // namespace HNSW

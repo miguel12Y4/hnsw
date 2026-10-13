@@ -1,31 +1,31 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
-
-#include "graph_models/object_id.h"
-#include "third_party/hashes/hash_function_wrapper.h"
+#include <utility>
+#include <vector>
 
 namespace HNSW {
 struct HNSWNode {
-    ObjectId object_oid; // Object id itself
-    ObjectId tensor_oid; // Tensor associated to the object_oid
+    uint64_t external_id;   // Object id itself
+    std::vector<float> vec; // Tensor associated to the object
 
     HNSWNode() = default;
 
-    HNSWNode(ObjectId object_oid_, ObjectId tensor_oid_) :
-        object_oid { object_oid_ },
-        tensor_oid { tensor_oid_ }
+    HNSWNode(uint64_t external_id_, std::vector<float> vec_) :
+        external_id { external_id_ },
+        vec { std::move(vec_) }
     { }
 
     inline bool operator==(const HNSWNode& other) const
     {
-        return object_oid == other.object_oid && tensor_oid == other.tensor_oid;
+        return external_id == other.external_id;
     }
 
     struct Hasher {
         size_t operator()(const HNSW::HNSWNode& node) const
         {
-            return HashFunctionWrapper(reinterpret_cast<const char*>(&node), 2 * sizeof(ObjectId));
+            return std::hash<uint64_t> {}(node.external_id);
         }
     };
 };

@@ -1,26 +1,23 @@
 #pragma once
 
+#include <cassert>
+#include <cmath>
+#include <cstdint>
 #include <memory>
 #include <random>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
-#include <boost/dynamic_bitset.hpp>
-#include <boost/unordered/unordered_map.hpp>
-
-#include "graph_models/common/datatypes/tensor/tensor.h"
-#include "graph_models/object_id.h"
-#include "storage/index/hnsw/hnsw_entry.h"
-#include "storage/index/hnsw/hnsw_entry_flat_map.h"
-#include "storage/index/hnsw/hnsw_heap.h"
-#include "storage/index/hnsw/hnsw_metric.h"
-#include "storage/index/hnsw/hnsw_node.h"
-#include "storage/index/hnsw/hnsw_query_iterator.h"
+#include "hnsw_entry.h"
+#include "hnsw_entry_flat_map.h"
+#include "hnsw_heap.h"
+#include "hnsw_metric.h"
+#include "hnsw_node.h"
+#include "hnsw_visited_set.h"
 
 namespace HNSW {
 class HNSWIndex {
-    friend class HNSWIndexManager;
-    friend class HNSWQueryIterator;
-
 public:
     struct HNSWIndexParams {
         uint64_t entry_point_id;  // entry id
@@ -40,7 +37,6 @@ public:
     // create a new index in memory
     // create a new index in memory
     static std::unique_ptr<HNSWIndex> create(
-        const std::string& hnsw_index_name,
         uint64_t dimensions,
         uint64_t max_neighbors,
         uint64_t ef_construction,
@@ -48,7 +44,10 @@ public:
     );
 
     // load an index from disk
-    static std::unique_ptr<HNSWIndex> load(const std::string& hnsw_index_name, MetricFuncType metric_func);
+    static std::unique_ptr<HNSWIndex> load(const std::string& path, MetricFuncType metric_func);
+
+    // save an index to disk
+    void save(const std::string& path) const;
 
     // Create constructor
     HNSWIndex(HNSWIndexParams params, MetricFuncType metric_func);
@@ -58,50 +57,20 @@ public:
         HNSWIndexParams params,
         MetricFuncType metric_func,
         std::vector<HNSWNode>&& node_storage,
-        std::vector<std::vector<HNSWEntryFlatMap>>&& node_neighbors_at_layer,
-        boost::dynamic_bitset<>&& node_tombstones
+        std::vector<std::vector<HNSWEntryFlatMap>>&& node_neighbors_at_layer
     );
+
+    // insert a point in the index
+    uint32_t add_point(const Tensor& vec, uint64_t external_id = UINT64_MAX);
 
     // find the the top num_neighbors from a pool of num_candidates
     HNSWHeap query(
-        const tensor::Tensor<float>& query_tensor,
+        const Tensor& query_tensor,
         uint64_t num_neighbors,
         uint64_t num_candidates,
         HNSWVisitedSet* visited_set,
         HNSWHeap* discarded_heap_ptr
     );
-
-    // get an iterator that traverses all nodes in an ANN-manner
-    std::unique_ptr<HNSWQueryIterator> query_iterator(
-        const bool* interruption_requested,
-        tensor::Tensor<float>&& query_tensor,
-        uint64_t num_neighbors,
-        uint64_t num_candidates
-    );
-
-    // resume the search (iterative querying) it is expected that the previous discarded_map will be the current entry points
-    HNSWHeap resume_query(
-        const tensor::Tensor<float>& query_tensor,
-        uint64_t batch_size,
-        const std::vector<Entry>& entry_points,
-        HNSWVisitedSet* visted_set_ptr,
-        HNSWHeap* discarded_heap_ptr
-    );
-
-    // index all { subject, object } pairs given a predicate (SPARQL)
-    // returns total inserted elements
-    uint_fast32_t index_predicate(const std::string& predicate);
-
-    // index all { object, value } pairs given a key (MQL)
-    // returns total inserted elements
-    uint_fast32_t index_property(const std::string& key);
-
-    // index a single entry
-    template<bool CheckTombstones>
-    bool index_single(ObjectId ref_object_id, ObjectId tensor_object_id);
-
-    // mark a single entry as deleted
-    bool remove_single(ObjectId ref_object_id, ObjectId tensor_object_id);
 
     inline const HNSWNode& get_node(uint32_t node_id) const
     {
@@ -115,8 +84,6 @@ public:
     }
 
 private:
-    bool has_changes { false };
-
     MetricFuncType metric_func;
 
     HNSWIndexParams params;
@@ -140,11 +107,8 @@ private:
     // This trade-off could be evaluated in the future.
     std::vector<std::vector<HNSWEntryFlatMap>> node_neighbors_at_layer;
 
-    // inverse of node_storage for { subject, object } lookup
-    boost::unordered_map<HNSWNode, uint32_t, HNSWNode::Hasher> hnsw_node2node_id;
-
-    // deleted nodes
-    boost::dynamic_bitset<> node_tombstones;
+    // inverse of node_storage for external_id lookup
+    std::unordered_map<HNSWNode, uint32_t, HNSWNode::Hasher> hnsw_node2node_id;
 
     // initialize constants for the index
     inline void init_constants()
@@ -154,18 +118,15 @@ private:
         random_layer_factor = 1.0l / std::log(static_cast<double>(params.M));
     }
 
-    inline uint64_t create_new_node(ObjectId object_oid, ObjectId tensor_oid, uint64_t top_layer)
+    inline uint64_t create_new_node(uint64_t external_id, const Tensor& vec, uint64_t top_layer)
     {
         const uint32_t node_id = node_storage.size();
         // create node
-        node_storage.emplace_back(object_oid, tensor_oid);
+        node_storage.emplace_back(external_id == UINT64_MAX ? node_id : external_id, vec);
 
         // create node's neighbors
         auto neighbors = std::vector<HNSWEntryFlatMap>(top_layer + 1);
         node_neighbors_at_layer.emplace_back(std::move(neighbors));
-
-        // create tombstone slot
-        node_tombstones.push_back(false);
 
         // add to inverse lookup
         hnsw_node2node_id.emplace(node_storage.back(), node_id);
@@ -174,9 +135,8 @@ private:
     }
 
     // search the top num_neighbors at a layer given a query and a group of entry points
-    template<bool CheckTombstones>
     HNSWHeap search_at_layer(
-        const tensor::Tensor<float>& query_tensor,
+        const Tensor& query_tensor,
         const std::vector<Entry>& entry_points,
         uint64_t num_neighbors,
         uint64_t layer,

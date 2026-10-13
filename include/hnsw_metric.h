@@ -1,11 +1,14 @@
 #pragma once
 
-#include "graph_models/common/datatypes/tensor/tensor.h"
-
+#include <cmath>
 #include <cstdint>
 #include <ostream>
+#include <string>
+#include <vector>
 
 namespace HNSW {
+
+using Tensor = std::vector<float>;
 
 enum class MetricType : uint8_t {
     EUCLIDEAN_DISTANCE,
@@ -32,18 +35,50 @@ inline std::ostream& operator<<(std::ostream& os, MetricType type)
     return os << to_string(type);
 }
 
-using MetricFuncType = float (*)(const tensor::Tensor<float>&, const tensor::Tensor<float>&);
+inline float euclidean_distance(const Tensor& a, const Tensor& b)
+{
+    float sum = 0.0f;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const float diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return std::sqrt(sum);
+}
+
+inline float manhattan_distance(const Tensor& a, const Tensor& b)
+{
+    float sum = 0.0f;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        sum += std::fabs(a[i] - b[i]);
+    }
+    return sum;
+}
+
+inline float cosine_distance(const Tensor& a, const Tensor& b)
+{
+    float dot = 0.0f;
+    float norm_a = 0.0f;
+    float norm_b = 0.0f;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    return 1.0f - dot / (std::sqrt(norm_a) * std::sqrt(norm_b) + 1e-9f);
+}
+
+using MetricFuncType = float (*)(const Tensor&, const Tensor&);
 
 // Helper function that maps MetricType to metric functions. If an unknown metric name is given, it returns nullptr
 inline MetricFuncType metric_type2metric_func(MetricType metric_type)
 {
     switch (metric_type) {
     case MetricType::EUCLIDEAN_DISTANCE:
-        return tensor::Tensor<float>::euclidean_distance;
+        return euclidean_distance;
     case MetricType::MANHATTAN_DISTANCE:
-        return tensor::Tensor<float>::manhattan_distance;
+        return manhattan_distance;
     case MetricType::COSINE_DISTANCE:
-        return tensor::Tensor<float>::cosine_distance;
+        return cosine_distance;
     default:
         return nullptr;
     }

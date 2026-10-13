@@ -1,38 +1,24 @@
 #include "hnsw_index.h"
 
+#include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <stdexcept>
 
-#include "graph_models/quad_model/quad_model.h"
-#include "graph_models/quad_model/quad_object_id.h"
-#include "graph_models/rdf_model/conversions.h"
-#include "graph_models/rdf_model/rdf_model.h"
-#include "query/optimizer/quad_model/plan/property_plan.h"
-#include "query/optimizer/rdf_model/plan/triple_plan.h"
-#include "query/query_context.h"
-#include "storage/index/hnsw/hnsw_heap.h"
-#include "storage/index/hnsw/hnsw_index_manager.h"
-#include "storage/index/hnsw/hnsw_visited_set.h"
-#include "system/file_manager.h"
+#include "hnsw_heap.h"
+#include "hnsw_visited_set.h"
 
 namespace fs = std::filesystem;
 
 namespace HNSW {
 std::unique_ptr<HNSWIndex> HNSWIndex::create(
-    const std::string& hnsw_index_name,
     uint64_t dimensions,
     uint64_t max_neighbors,
     uint64_t n_candidates_insertion,
     MetricFuncType metric_func
 )
 {
-    const auto relative_index_path = fs::path(HNSWIndexManager::HNSW_INDEX_DIR) / hnsw_index_name;
-    const auto absolute_index_path = file_manager.get_file_path(relative_index_path);
-
-    if (!fs::create_directories(absolute_index_path)) {
-        throw std::runtime_error("Could not create directories: " + absolute_index_path);
-    };
-
     HNSWIndexParams params {};
     params.entry_point_id = 0;
     params.dimensions = dimensions;
@@ -43,11 +29,9 @@ std::unique_ptr<HNSWIndex> HNSWIndex::create(
     return std::make_unique<HNSWIndex>(params, metric_func);
 }
 
-std::unique_ptr<HNSWIndex> HNSWIndex::load(const std::string& hnsw_index_name, MetricFuncType metric_func)
+std::unique_ptr<HNSWIndex> HNSWIndex::load(const std::string& path, MetricFuncType metric_func)
 {
-    const auto relative_index_path = fs::path(HNSWIndexManager::HNSW_INDEX_DIR) / hnsw_index_name;
-    const auto absolute_index_path = file_manager.get_file_path(relative_index_path);
-    const auto absolute_data_file_path = fs::path(absolute_index_path) / HNSWIndex::DATA_FILENAME;
+    const auto absolute_data_file_path = fs::path(path) / HNSWIndex::DATA_FILENAME;
 
     std::fstream ifs(absolute_data_file_path, std::ios::in | std::ios::binary);
 
@@ -65,19 +49,25 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load(const std::string& hnsw_index_name, M
     }
 
     std::vector<HNSWNode> node_storage;
-    std::vector<std::vector<HNSWEntryFlatMap>> node_neighbors;
+    std::vector<std::vector<HNSWEntryFlatMap>> node_neighbors_at_layer;
 
     node_storage.reserve(num_nodes);
-    node_neighbors.reserve(num_nodes);
+    node_neighbors_at_layer.reserve(num_nodes);
 
     for (uint32_t node_id = 0; node_id < num_nodes; ++node_id) {
         // read node
-        HNSWNode node {};
-        ifs.read(reinterpret_cast<char*>(&node), sizeof(HNSWNode));
+        uint64_t external_id;
+        ifs.read(reinterpret_cast<char*>(&external_id), sizeof(uint64_t));
         if (!ifs.good()) {
             throw std::runtime_error("Could not read index file");
         }
-        node_storage.emplace_back(std::move(node));
+
+        Tensor node_vec(params.dimensions);
+        ifs.read(reinterpret_cast<char*>(node_vec.data()), params.dimensions * sizeof(float));
+        if (!ifs.good()) {
+            throw std::runtime_error("Could not read index file");
+        }
+        node_storage.emplace_back(external_id, std::move(node_vec));
 
         // read neighbors
         uint64_t num_layers;
@@ -86,7 +76,7 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load(const std::string& hnsw_index_name, M
             throw std::runtime_error("Could not read index file");
         }
 
-        node_neighbors.emplace_back(std::vector<HNSWEntryFlatMap>(num_layers));
+        node_neighbors_at_layer.emplace_back(std::vector<HNSWEntryFlatMap>(num_layers));
 
         for (uint64_t layer_i = 0; layer_i < num_layers; ++layer_i) {
             uint64_t num_neighbors_at_layer_i;
@@ -101,52 +91,96 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load(const std::string& hnsw_index_name, M
                 if (!ifs.good()) {
                     throw std::runtime_error("Could not read index file");
                 }
-                node_neighbors[node_id][layer_i].emplace(entry_buf);
+                node_neighbors_at_layer[node_id][layer_i].emplace(entry_buf);
             }
         }
     }
-
-    // read tombstones
-    using block_type = boost::dynamic_bitset<>::block_type;
-    boost::dynamic_bitset<> tombstone_bitset(node_storage.size());
-
-    std::vector<block_type> tombstone_blocks(tombstone_bitset.num_blocks());
-    ifs.read(reinterpret_cast<char*>(tombstone_blocks.data()), sizeof(block_type) * tombstone_blocks.size());
-    if (!ifs.good()) {
-        throw std::runtime_error("Could not read index file");
-    }
-    boost::from_block_range(tombstone_blocks.begin(), tombstone_blocks.end(), tombstone_bitset);
 
     return std::make_unique<HNSWIndex>(
         params,
         metric_func,
         std::move(node_storage),
-        std::move(node_neighbors),
-        std::move(tombstone_bitset)
+        std::move(node_neighbors_at_layer)
     );
 }
 
+void HNSWIndex::save(const std::string& path) const
+{
+    fs::create_directories(path);
+    const auto absolute_data_file_path = fs::path(path) / HNSWIndex::DATA_FILENAME;
+
+    std::fstream ofs(absolute_data_file_path, std::ios::out | std::ios::trunc | std::ios::binary);
+    // write params
+    ofs.write(reinterpret_cast<const char*>(&params), sizeof(HNSWIndexParams));
+    if (!ofs.good()) {
+        throw std::runtime_error("Could not write index file");
+    }
+
+    const uint64_t num_nodes = node_storage.size();
+    ofs.write(reinterpret_cast<const char*>(&num_nodes), sizeof(uint64_t));
+    if (!ofs.good()) {
+        throw std::runtime_error("Could not write index file");
+    }
+
+    for (uint32_t node_id = 0; node_id < num_nodes; ++node_id) {
+        // write node
+        const HNSWNode& node = node_storage[node_id];
+        ofs.write(reinterpret_cast<const char*>(&node.external_id), sizeof(uint64_t));
+        ofs.write(reinterpret_cast<const char*>(node.vec.data()), params.dimensions * sizeof(float));
+        if (!ofs.good()) {
+            throw std::runtime_error("Could not write index file");
+        }
+
+        // write neighbors
+        const auto& node_neighbors_at_layers = node_neighbors_at_layer[node_id];
+        const uint64_t num_layers = node_neighbors_at_layers.size();
+        ofs.write(reinterpret_cast<const char*>(&num_layers), sizeof(uint64_t));
+        if (!ofs.good()) {
+            throw std::runtime_error("Could not write index file");
+        }
+
+        for (const auto& neighbors_at_layer_i : node_neighbors_at_layers) {
+            // layer i size
+            const uint64_t num_neighbors_at_layer_i = neighbors_at_layer_i.size();
+            ofs.write(reinterpret_cast<const char*>(&num_neighbors_at_layer_i), sizeof(uint64_t));
+            if (!ofs.good()) {
+                throw std::runtime_error("Could not write index file");
+            }
+
+            // layer i data
+            for (const auto& neighbor_entry : neighbors_at_layer_i) {
+                ofs.write(reinterpret_cast<const char*>(&neighbor_entry), sizeof(neighbor_entry));
+                if (!ofs.good()) {
+                    throw std::runtime_error("Could not write index file");
+                }
+            }
+        }
+    }
+}
+
 HNSWHeap HNSWIndex::query(
-    const tensor::Tensor<float>& query_tensor,
+    const Tensor& query_tensor,
     uint64_t num_neighbors,
     uint64_t num_candidates,
     HNSWVisitedSet* visited_set,
     HNSWHeap* discarded_heap_ptr
 )
 {
+    if (node_storage.empty()) {
+        return HNSWHeap(num_neighbors);
+    }
+
     const uint64_t top_layer = params.layers - 1;
 
     // Initialize with entry point
-    const auto entry_tensor = Common::Conversions::to_tensor<float>(
-        node_storage[params.entry_point_id].tensor_oid
-    );
+    const auto& entry_tensor = node_storage[params.entry_point_id].vec;
     const float entry_dist = metric_func(query_tensor, entry_tensor);
     std::vector<Entry> entry_points;
     entry_points.emplace_back(entry_dist, params.entry_point_id);
 
     // find the best set entry points for layer 0
     for (uint64_t current_layer = top_layer; current_layer > 0; --current_layer) {
-        const auto current_layer_nns = search_at_layer<true>(
+        const auto current_layer_nns = search_at_layer(
             query_tensor,
             entry_points,
             1,
@@ -158,7 +192,7 @@ HNSWHeap HNSWIndex::query(
         entry_points[0] = current_layer_nns.get_min();
     }
 
-    auto nearest_neighbors = search_at_layer<true>(
+    auto nearest_neighbors = search_at_layer(
         query_tensor,
         entry_points,
         num_candidates,
@@ -194,141 +228,24 @@ HNSWHeap HNSWIndex::query(
     return res;
 }
 
-std::unique_ptr<HNSWQueryIterator> HNSWIndex::query_iterator(
-    const bool* interruption_requested,
-    tensor::Tensor<float>&& query_tensor,
-    uint64_t num_neighbors,
-    uint64_t num_candidates
-)
+uint32_t HNSWIndex::add_point(const Tensor& query_tensor, uint64_t external_id)
 {
-    return std::make_unique<HNSWQueryIterator>(
-        interruption_requested,
-        this,
-        std::move(query_tensor),
-        num_neighbors,
-        num_candidates
-    );
-}
-
-HNSWHeap HNSWIndex::resume_query(
-    const tensor::Tensor<float>& query_tensor,
-    uint64_t batch_size,
-    const std::vector<Entry>& entry_points,
-    HNSWVisitedSet* visited_set_ptr,
-    HNSWHeap* discarded_heap_ptr
-)
-{
-    return search_at_layer<true>(
-        query_tensor,
-        entry_points,
-        batch_size,
-        0,
-        visited_set_ptr,
-        discarded_heap_ptr
-    );
-}
-
-uint_fast32_t HNSWIndex::index_predicate(const std::string& predicate)
-{
-    const auto subject_var = get_query_ctx().get_internal_var();
-    const auto predicate_val = SPARQL::Conversions::pack_iri(predicate);
-    const auto object_var = get_query_ctx().get_internal_var();
-
-    const auto triple_plan = SPARQL::TriplePlan(subject_var, predicate_val, object_var);
-    auto triple_plan_iter = triple_plan.get_binding_iter();
-
-    Binding binding(get_query_ctx().get_var_size());
-    triple_plan_iter->begin(binding);
-
-    const std::size_t num_expected_insertions = rdf_model.catalog.get_predicate_count(predicate_val.id);
-
-    node_storage.reserve(num_expected_insertions);
-    node_neighbors_at_layer.reserve(num_expected_insertions);
-
-    uint_fast32_t total_inserted_elements = 0;
-    while (triple_plan_iter->next()) {
-        const auto object_oid = binding[object_var];
-        const auto subject_oid = binding[subject_var];
-
-        if (index_single<false>(subject_oid, object_oid)) {
-            ++total_inserted_elements;
-        }
-    }
-
-    return total_inserted_elements;
-}
-
-uint_fast32_t HNSWIndex::index_property(const std::string& key)
-{
-    const auto object_var = get_query_ctx().get_internal_var();
-    const auto key_val = QuadObjectId::get_string(key);
-    const auto value_var = get_query_ctx().get_internal_var();
-
-    const auto property_plan = PropertyPlan(object_var, key_val, value_var);
-
-    auto property_plan_iter = property_plan.get_binding_iter();
-
-    Binding binding(get_query_ctx().get_var_size());
-    property_plan_iter->begin(binding);
-
-    auto it = quad_model.catalog.key2total_count.find(key_val.id);
-    std::size_t num_expected_insertions = 0;
-    if (it != quad_model.catalog.key2total_count.end()) {
-        num_expected_insertions = it->second;
-    }
-
-    node_storage.reserve(num_expected_insertions);
-    node_neighbors_at_layer.reserve(num_expected_insertions);
-
-    uint_fast32_t total_inserted_elements { 0 };
-    while (property_plan_iter->next()) {
-        const auto object_oid = binding[object_var];
-        const auto value_oid = binding[value_var];
-
-        if (index_single<false>(object_oid, value_oid)) {
-            ++total_inserted_elements;
-        }
-    }
-
-    return total_inserted_elements;
-}
-
-template<bool CheckTombstones>
-bool HNSWIndex::index_single(ObjectId ref_object_id, ObjectId tensor_object_id)
-{
-    const auto gen_t = RDF_OID::get_generic_type(tensor_object_id);
-    if (gen_t != RDF_OID::GenericType::TENSOR) {
-        // Object is not a tensor
-        return false;
-    }
-
-    if constexpr (CheckTombstones) {
-        HNSWNode hnsw_node(ref_object_id, tensor_object_id);
-
-        const auto it = hnsw_node2node_id.find(hnsw_node);
-        if (it != hnsw_node2node_id.end()) {
-            // entry is already in graph, unset its tombstone
-            assert(node_tombstones.test(it->second) && "inserted an already set triple. Something went wrong");
-            node_tombstones.set(it->second, false);
-            has_changes = true;
-            return true;
-        }
-    }
-
-    const auto query_tensor = Common::Conversions::to_tensor<float>(tensor_object_id);
     if (query_tensor.size() != params.dimensions) {
         // Tensor dimension does not match
-        return false;
+        throw std::runtime_error("Tensor dimension does not match index dimensions");
     }
 
     // Create new node at a random layer
     const uint64_t node_top_layer = get_random_layer();
-    const uint64_t node_id = create_new_node(ref_object_id, tensor_object_id, node_top_layer);
+
+    if (node_storage.empty()) {
+        return create_new_node(external_id, query_tensor, 0);
+    }
+
+    const uint64_t node_id = create_new_node(external_id, query_tensor, node_top_layer);
 
     // Initialize with entry point
-    const auto entry_tensor = Common::Conversions::to_tensor<float>(
-        node_storage[params.entry_point_id].tensor_oid
-    );
+    const auto& entry_tensor = node_storage[params.entry_point_id].vec;
     const auto entry_dist = metric_func(query_tensor, entry_tensor);
     std::vector<Entry> entry_points;
     entry_points.emplace_back(entry_dist, params.entry_point_id);
@@ -336,7 +253,7 @@ bool HNSWIndex::index_single(ObjectId ref_object_id, ObjectId tensor_object_id)
     // Update the best entry point for layers in range [top_layer, node_top_layer)
     const uint64_t top_layer = params.layers - 1;
     for (uint64_t current_layer = top_layer; current_layer > node_top_layer; --current_layer) {
-        const auto current_layer_nns = search_at_layer<CheckTombstones>(
+        const auto current_layer_nns = search_at_layer(
             query_tensor,
             entry_points,
             1,
@@ -350,7 +267,7 @@ bool HNSWIndex::index_single(ObjectId ref_object_id, ObjectId tensor_object_id)
 
     // Insert in node's layer and the layers below
     for (int64_t current_layer = std::min(node_top_layer, top_layer); current_layer >= 0; --current_layer) {
-        auto current_layer_nns = search_at_layer<CheckTombstones>(
+        auto current_layer_nns = search_at_layer(
             query_tensor,
             entry_points,
             params.ef_construction,
@@ -374,23 +291,7 @@ bool HNSWIndex::index_single(ObjectId ref_object_id, ObjectId tensor_object_id)
         params.layers = node_top_layer + 1;
     };
 
-    has_changes = true;
-
-    return true;
-}
-
-bool HNSWIndex::remove_single(ObjectId ref_object_id, ObjectId tensor_object_id)
-{
-    HNSWNode hnsw_node(ref_object_id, tensor_object_id);
-
-    const auto it = hnsw_node2node_id.find(hnsw_node);
-    assert(it != hnsw_node2node_id.end());
-
-    node_tombstones.set(it->second, true);
-
-    has_changes = true;
-
-    return true;
+    return node_id;
 }
 
 HNSWIndex::HNSWIndex(HNSWIndexParams params_, MetricFuncType metric_func_) :
@@ -404,14 +305,12 @@ HNSWIndex::HNSWIndex(
     HNSWIndexParams params_,
     MetricFuncType metric_func_,
     std::vector<HNSWNode>&& node_storage_,
-    std::vector<std::vector<HNSWEntryFlatMap>>&& node_neighbors_at_layer_,
-    boost::dynamic_bitset<>&& node_tombstones_
+    std::vector<std::vector<HNSWEntryFlatMap>>&& node_neighbors_at_layer_
 ) :
     metric_func { metric_func_ },
     params { params_ },
     node_storage { std::move(node_storage_) },
-    node_neighbors_at_layer { std::move(node_neighbors_at_layer_) },
-    node_tombstones { node_tombstones_ }
+    node_neighbors_at_layer { std::move(node_neighbors_at_layer_) }
 {
     init_constants();
 
@@ -420,9 +319,8 @@ HNSWIndex::HNSWIndex(
     }
 }
 
-template<bool CheckTombstones>
 HNSWHeap HNSWIndex::search_at_layer(
-    const tensor::Tensor<float>& query_tensor,
+    const Tensor& query_tensor,
     const std::vector<Entry>& entry_points,
     uint64_t num_neighbors,
     uint64_t layer,
@@ -469,24 +367,13 @@ HNSWHeap HNSWIndex::search_at_layer(
         // explore candidate's neighborhood
         for (const Entry& candidate_neighbor_entry : node_neighbors_at_layer[candidate_entry.node_id][layer])
         {
-            if (visited_set_ptr->contains(candidate_neighbor_entry.node_id)) {
+            if (visited_set_ptr->find(candidate_neighbor_entry.node_id) != visited_set_ptr->end()) {
                 continue;
             }
             visited_set_ptr->emplace(candidate_neighbor_entry.node_id);
 
-            const auto candidate_neighbor_tensor = Common::Conversions::to_tensor<float>(
-                node_storage[candidate_neighbor_entry.node_id].tensor_oid
-            );
+            const auto& candidate_neighbor_tensor = node_storage[candidate_neighbor_entry.node_id].vec;
             const float candidate_neighbor_dist = metric_func(query_tensor, candidate_neighbor_tensor);
-
-            if constexpr (CheckTombstones) {
-                if (node_tombstones.test(candidate_neighbor_entry.node_id)) {
-                    // candidate_neighbor_entry.node_id is marked as deleted,
-                    // it can be explored but not added to the top_k_heap
-                    candidates_heap.emplace(candidate_neighbor_dist, candidate_neighbor_entry.node_id);
-                    continue;
-                }
-            }
 
             if (top_k_heap.size() < num_neighbors) {
                 // always add, not enough results
@@ -525,8 +412,6 @@ void HNSWIndex::set_neighbors_at_layer(
     const auto max_neighbors = layer == 0 ? M0 : Mi;
     assert(new_neighbors.size() <= max_neighbors);
 
-    node_neighbors_at_layer[node_id][layer].reserve(new_neighbors.size());
-
     for (const Entry& new_neighbor_entry : new_neighbors) {
         // node -> neighbor
         node_neighbors_at_layer[node_id][layer].emplace(new_neighbor_entry);
@@ -548,6 +433,3 @@ void HNSWIndex::set_neighbors_at_layer(
 }
 
 } // namespace HNSW
-
-template bool HNSW::HNSWIndex::index_single<false>(ObjectId, ObjectId);
-template bool HNSW::HNSWIndex::index_single<true>(ObjectId, ObjectId);

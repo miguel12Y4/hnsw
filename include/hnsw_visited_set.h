@@ -1,9 +1,9 @@
 #pragma once
 
-#include <boost/unordered/unordered_set.hpp>
+#include <unordered_set>
 
 namespace HNSW {
 
-using HNSWVisitedSet = boost::unordered_set<uint32_t>;
+using HNSWVisitedSet = std::unordered_set<uint32_t>;
 
 } // namespace HNSW
